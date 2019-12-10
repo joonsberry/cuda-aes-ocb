@@ -1,17 +1,31 @@
-// AES OCB Licenses: http://web.cs.ucdavis.edu/~rogaway/ocb/license.htm
-// Applied license: License 1
-// Found at: http://web.cs.ucdavis.edu/~rogaway/ocb/license1.pdf
-// OCB FAQ: http://www.cs.ucdavis.edu/~rogaway/ocb/ocb-faq.htm
+/* Project: CUDA AES-OCB
+ * Author: Jonathan Kenney
+ *
+ * Much of this source is thanks to Github user DesWurstes
+ * See their work on pure C AES: https://github.com/DesWurstes/OCB-AES
+ * All host functions and constants were contrived by DesWurstes,
+ * the goal of this module is to achieve CUDA implementation for the
+ * full cipher block computations.
+ *
+ * Original acknowledgements from DesWurstes:
+ *
+ * AES OCB Licenses: http://web.cs.ucdavis.edu/~rogaway/ocb/license.htm
+ * Applied license: License 1
+ * Found at: http://web.cs.ucdavis.edu/~rogaway/ocb/license1.pdf
+ * OCB FAQ: http://www.cs.ucdavis.edu/~rogaway/ocb/ocb-faq.htm
+ *
+ * The source code is derived from this, except the blockcipher functions:
+ * https://tools.ietf.org/pdf/rfc7253.pdf
+ *
+ * For the curious:
+ * Unneeded extra: https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
+ * More extra: https://link.springer.com/content/pdf/10.1007%2F978-3-642-21702-9_18.pdf
+ *
+ * Cipher functions are taken from (Public domain)
+ * https://github.com/kokke/tiny-AES-c/blob/master/aes.c
+*/
 
-// The source code is derived from this, except the blockcipher functions:
-// https://tools.ietf.org/pdf/rfc7253.pdf
-
-// For the curious:
-// Unneeded extra: https://csrc.nist.gov/csrc/media/publications/fips/197/final/documents/fips-197.pdf
-// More extra: https://link.springer.com/content/pdf/10.1007%2F978-3-642-21702-9_18.pdf
-
-// Cipher functions are taken from (Public domain)
-// https://github.com/kokke/tiny-AES-c/blob/master/aes.c
+#include <time.h>
 
 #ifdef __GNUC__
 #define USE_BUILTIN
@@ -32,12 +46,7 @@ for (int _i = 0; _i < (c); _i++) \
 #define OCB_NONCEPARAM unsigned int nonce_length,
 #endif
 
-#ifdef OCB_NO_AD
-#define OCB_ADPARAM
-#define associated_data_length 0
-#else
-#define OCB_ADPARAM const unsigned char * __restrict associated_data, int associated_data_length,
-#endif
+//--------------------HOST CONSTANTS--------------------
 
 static const unsigned char sbox[256] = {
   //0     1     2     3     4     5     6     7     8     9     A     B     C     D     E     F
@@ -76,17 +85,24 @@ static const unsigned char rsbox[256] = {
   0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
   0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d};
 
-static const unsigned char rcon[11] = {0x8d, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36};
+  static const unsigned char rcon[11] = {0x8d, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36};
+
+//--------------------CUDA CONSTANTS--------------------
+
+__constant__ unsigned char *d_sbox;
+__constant__ unsigned char *d_rsbox;
+
+//--------------------HOST FUNCTIONS--------------------
 
 // The SubBytes Function Substitutes the values in the
 // state matrix with values in an S-box.
-__global__ static void sub_bytes(unsigned char state[16])
+static void sub_bytes(unsigned char state[16])
 {
   for (int i = 0; i < 16; i++)
     state[i] = sbox[state[i]];
 }
 
-__global__ static void inv_sub_bytes(unsigned char state[16])
+static void inv_sub_bytes(unsigned char state[16])
 {
   for (int i = 0; i < 16; i++)
     state[i] = rsbox[state[i]];
@@ -95,7 +111,7 @@ __global__ static void inv_sub_bytes(unsigned char state[16])
 // The ShiftRows() function shifts the rows in the state to the left.
 // Each row is shifted with different offset.
 // Offset = Row number. So the first row is not shifted.
-__global__ static void shift_rows(unsigned char state[16])
+static void shift_rows(unsigned char state[16])
 {
   unsigned char temp;
 
@@ -123,7 +139,7 @@ __global__ static void shift_rows(unsigned char state[16])
   state[1 * 4 + 3] = temp;
 }
 
-__global__ static void inv_shift_rows(unsigned char state[16])
+static void inv_shift_rows(unsigned char state[16])
 {
   unsigned char temp;
 
@@ -153,18 +169,18 @@ __global__ static void inv_shift_rows(unsigned char state[16])
 
 // This function adds the round key to state.
 // The round key is added to the state by an XOR function.
-__global__ static void add_round_key(unsigned char round, unsigned char state[16], const unsigned char * __restrict round_key)
+static void add_round_key(unsigned char round, unsigned char state[16], const unsigned char * __restrict round_key)
 {
   for (int i = 0; i < 16; ++i)
     state[i] ^= round_key[(round * 16) + i];
 }
 
-__global__ static inline unsigned char xtime(unsigned char x)
+static inline unsigned char xtime(unsigned char x)
 {
   return ((x << 1) ^ (((x >> 7) & 1) * 0x1b));
 }
 
-__global__ static inline unsigned char Multiply(unsigned char x, unsigned char y) {
+static inline unsigned char Multiply(unsigned char x, unsigned char y) {
   return (((y & 1) * x) ^
     ((y >> 1 & 1) * xtime(x)) ^
     ((y >> 2 & 1) * xtime(xtime(x))) ^
@@ -172,7 +188,7 @@ __global__ static inline unsigned char Multiply(unsigned char x, unsigned char y
 }
 
 // MixColumns function mixes the columns of the state matrix
-__global__ static void mix_columns(unsigned char state[16])
+static void mix_columns(unsigned char state[16])
 {
   unsigned char Tmp, Tm, t;
   for (int i = 0; i < 4; i++)
@@ -186,7 +202,7 @@ __global__ static void mix_columns(unsigned char state[16])
   }
 }
 
-__global__ static void inv_mix_columns(unsigned char state[16])
+static void inv_mix_columns(unsigned char state[16])
 {
   unsigned char a, b, c, d;
   for (int i = 0; i < 4; i++)
@@ -205,7 +221,7 @@ __global__ static void inv_mix_columns(unsigned char state[16])
 
 // Cipher is the main function that encrypts the PlainText.
 // round_key is of len 240 chars.
-__global__ static void cipher(unsigned char state[16], const unsigned char * __restrict round_key)
+static void cipher(unsigned char state[16], const unsigned char * __restrict round_key)
 {
   // Add the First round key to the state before starting the rounds.
   add_round_key(0, state, round_key);
@@ -352,57 +368,225 @@ static inline unsigned int ocb_ntz(unsigned int a) {
 }
 #endif
 
-__global__ static inline void xor_16(unsigned char * __restrict a, const unsigned char * __restrict b) {
+static inline void xor_16(unsigned char * __restrict a, const unsigned char * __restrict b) {
   for (int i = 0; i < 16; i++)
     a[i] ^= b[i];
 }
 
-#ifndef OCB_NO_AD
-static void hash(const unsigned char * __restrict round_key, OCB_ADPARAM
-  const unsigned char l[][16], const unsigned char * __restrict l_asterisk,
-  unsigned char * __restrict out) {
-  const unsigned int m = associated_data_length / 16;
+//--------------------CUDA KERNELS/FUNCTIONS--------------------
 
-  unsigned char offset[16] = {0};
-  unsigned char cipher_temp[16];
-
+// The SubBytes Function Substitutes the values in the
+// state matrix with values in an S-box.
+__device__ void cuda_sub_bytes(unsigned char state[16])
+{
   for (int i = 0; i < 16; i++)
-    out[i] = 0;
+    state[i] = d_sbox[state[i]];
+}
 
-  for (int i = 0; i < m; i++) {
-    for (int k = 0; k < 16; k++)
-      cipher_temp[k] = associated_data[i * 16 + k];
-    xor_16(offset, l[ocb_ntz(i + 1)]);
-    xor_16(cipher_temp, offset);
-    cipher(cipher_temp, round_key);
-    xor_16(out, cipher_temp);
-  }
+__device__ void cuda_inv_sub_bytes(unsigned char state[16])
+{
+  for (int i = 0; i < 16; i++)
+    state[i] = d_rsbox[state[i]];
+}
 
-  const unsigned int a_asterisk_length = (unsigned int) (associated_data_length % 16);
-  const unsigned int full_block_length = associated_data_length ^ a_asterisk_length;
-  if (a_asterisk_length > 0) {
-    xor_16(offset, l_asterisk);
-    for (unsigned int i = 0; i < a_asterisk_length; i++)
-      cipher_temp[i] = associated_data[full_block_length + i];
-    cipher_temp[a_asterisk_length] = 0x80;
-    for (int i = a_asterisk_length + 1; i < 16; i++)
-      cipher_temp[i] = 0;
-    xor_16(cipher_temp, offset);
-    cipher(cipher_temp, round_key);
-    xor_16(out, cipher_temp);
+// The ShiftRows() function shifts the rows in the state to the left.
+// Each row is shifted with different offset.
+// Offset = Row number. So the first row is not shifted.
+__device__ void cuda_shift_rows(unsigned char state[16])
+{
+  unsigned char temp;
+
+  // Rotate first row 1 columns to left
+  temp        = state[0 * 4 + 1];
+  state[0 * 4 + 1] = state[1 * 4 + 1];
+  state[1 * 4 + 1] = state[2 * 4 + 1];
+  state[2 * 4 + 1] = state[3 * 4 + 1];
+  state[3 * 4 + 1] = temp;
+
+  // Rotate second row 2 columns to left
+  temp        = state[0 * 4 + 2];
+  state[0 * 4 + 2] = state[2 * 4 + 2];
+  state[2 * 4 + 2] = temp;
+
+  temp        = state[1 * 4 + 2];
+  state[1 * 4 + 2] = state[3 * 4 + 2];
+  state[3 * 4 + 2] = temp;
+
+  // Rotate third row 3 columns to left
+  temp        = state[0 * 4 + 3];
+  state[0 * 4 + 3] = state[3 * 4 + 3];
+  state[3 * 4 + 3] = state[2 * 4 + 3];
+  state[2 * 4 + 3] = state[1 * 4 + 3];
+  state[1 * 4 + 3] = temp;
+}
+
+__device__ void cuda_inv_shift_rows(unsigned char state[16])
+{
+  unsigned char temp;
+
+  // Rotate first row 1 columns to right
+  temp = state[3 * 4 + 1];
+  state[3 * 4 + 1] = state[2 * 4 + 1];
+  state[2 * 4 + 1] = state[1 * 4 + 1];
+  state[1 * 4 + 1] = state[0 * 4 + 1];
+  state[0 * 4 + 1] = temp;
+
+  // Rotate second row 2 columns to right
+  temp = state[0 * 4 + 2];
+  state[0 * 4 + 2] = state[2 * 4 + 2];
+  state[2 * 4 + 2] = temp;
+
+  temp = state[1 * 4 + 2];
+  state[1 * 4 + 2] = state[3 * 4 + 2];
+  state[3 * 4 + 2] = temp;
+
+  // Rotate third row 3 columns to right
+  temp = state[0 * 4 + 3];
+  state[0 * 4 + 3] = state[1 * 4 + 3];
+  state[1 * 4 + 3] = state[2 * 4 + 3];
+  state[2 * 4 + 3] = state[3 * 4 + 3];
+  state[3 * 4 + 3] = temp;
+}
+
+// This function adds the round key to state.
+// The round key is added to the state by an XOR function.
+__device__ void cuda_add_round_key(unsigned char round, unsigned char state[16], const unsigned char * __restrict round_key)
+{
+  for (int i = 0; i < 16; ++i)
+    state[i] ^= round_key[(round * 16) + i];
+}
+
+__device__ unsigned char cuda_xtime(unsigned char x)
+{
+  return ((x << 1) ^ (((x >> 7) & 1) * 0x1b));
+}
+
+__device__ unsigned char cuda_Multiply(unsigned char x, unsigned char y) {
+  return (((y & 1) * x) ^
+    ((y >> 1 & 1) * cuda_xtime(x)) ^
+    ((y >> 2 & 1) * cuda_xtime(cuda_xtime(x))) ^
+    ((y >> 3 & 1) * cuda_xtime(cuda_xtime(cuda_xtime(x)))));
+}
+
+// MixColumns function mixes the columns of the state matrix
+__device__ void cuda_mix_columns(unsigned char state[16])
+{
+  unsigned char Tmp, Tm, t;
+  for (int i = 0; i < 4; i++)
+  {
+    t   = state[4 * i + 0];
+    Tmp = state[4 * i + 0] ^ state[4 * i + 1] ^ state[4 * i + 2] ^ state[4 * i + 3];
+    Tm  = state[4 * i + 0] ^ state[4 * i + 1] ; Tm = cuda_xtime(Tm);  state[4 * i + 0] ^= Tm ^ Tmp;
+    Tm  = state[4 * i + 1] ^ state[4 * i + 2] ; Tm = cuda_xtime(Tm);  state[4 * i + 1] ^= Tm ^ Tmp;
+    Tm  = state[4 * i + 2] ^ state[4 * i + 3] ; Tm = cuda_xtime(Tm);  state[4 * i + 2] ^= Tm ^ Tmp;
+    Tm  = state[4 * i + 3] ^ t ;           Tm = cuda_xtime(Tm);  state[4 * i + 3] ^= Tm ^ Tmp;
   }
 }
-#endif
 
+__device__ void cuda_inv_mix_columns(unsigned char state[16])
+{
+  unsigned char a, b, c, d;
+  for (int i = 0; i < 4; i++)
+  {
+    a = state[4 * i + 0];
+    b = state[4 * i + 1];
+    c = state[4 * i + 2];
+    d = state[4 * i + 3];
 
+    state[4 * i + 0] = cuda_Multiply(a, 0x0e) ^ cuda_Multiply(b, 0x0b) ^ cuda_Multiply(c, 0x0d) ^ cuda_Multiply(d, 0x09);
+    state[4 * i + 1] = cuda_Multiply(a, 0x09) ^ cuda_Multiply(b, 0x0e) ^ cuda_Multiply(c, 0x0b) ^ cuda_Multiply(d, 0x0d);
+    state[4 * i + 2] = cuda_Multiply(a, 0x0d) ^ cuda_Multiply(b, 0x09) ^ cuda_Multiply(c, 0x0e) ^ cuda_Multiply(d, 0x0b);
+    state[4 * i + 3] = cuda_Multiply(a, 0x0b) ^ cuda_Multiply(b, 0x0d) ^ cuda_Multiply(c, 0x09) ^ cuda_Multiply(d, 0x0e);
+  }
+}
 
-static void ocb_encrypt(const unsigned char * __restrict key, const unsigned char * __restrict nonce, OCB_NONCEPARAM
-  const unsigned char * __restrict message, unsigned int message_length, OCB_ADPARAM unsigned char * out) {
+// Cipher is the main function that encrypts the PlainText.
+// round_key is of len 240 chars.
+__device__ void cuda_cipher(unsigned char state[16], const unsigned char * __restrict round_key)
+{
+  // Add the First round key to the state before starting the rounds.
+  cuda_add_round_key(0, state, round_key);
+
+  // There will be Nr rounds.
+  // The first Nr-1 rounds are identical.
+  // These Nr-1 rounds are executed in the loop below.
+  for (unsigned char round = 1; round < 14; round++)
+  {
+    cuda_sub_bytes(state);
+    cuda_shift_rows(state);
+    cuda_mix_columns(state);
+    cuda_add_round_key(round, state, round_key);
+  }
+
+  // The last round is given below.
+  // The MixColumns function is not here in the last round.
+  cuda_sub_bytes(state);
+  cuda_shift_rows(state);
+  cuda_add_round_key(14, state, round_key);
+}
+
+__device__ void cuda_decipher(unsigned char state[16], const unsigned char * __restrict round_key)
+{
+
+  // Add the First round key to the state before starting the rounds.
+  cuda_add_round_key(14, state, round_key);
+
+  // There will be Nr rounds.
+  // The first Nr-1 rounds are identical.
+  // These Nr-1 rounds are executed in the loop below.
+  for (unsigned char round = 13; round > 0; round--)
+  {
+    cuda_inv_shift_rows(state);
+    cuda_inv_sub_bytes(state);
+    cuda_add_round_key(round, state, round_key);
+    cuda_inv_mix_columns(state);
+  }
+
+  // The last round is given below.
+  // The MixColumns function is not here in the last round.
+  cuda_inv_shift_rows(state);
+  cuda_inv_sub_bytes(state);
+  cuda_add_round_key(0, state, round_key);
+}
+
+// largest x such that 2^x | a
+__device__ unsigned int cuda_ocb_ntz(unsigned int a) {
+  int k = 0;
+  while ((a % 2 == 0) && (a >>= 1))
+    k++;
+  return (unsigned int) k;
+}
+
+__device__ void cuda_xor_16(unsigned char * __restrict a, const unsigned char * __restrict b) {
+  for (int i = 0; i < 16; i++)
+    a[i] ^= b[i];
+}
+
+//__global__ static void pllize(unsigned char *sbox, unsigned char *rsbox, unsigned char *l, unsigned char *offset, unsigned char *round_key, unsigned char *out) {
+__global__ void penc(unsigned char **l, unsigned char **offsets, unsigned char *round_key, unsigned char *out) {
+  
+  cuda_xor_16(&out[blockIdx.x * 16], offsets[blockIdx.x]);
+  cuda_cipher(&out[blockIdx.x * 16], round_key);
+  cuda_xor_16(&out[blockIdx.x * 16], offsets[blockIdx.x]);
+  
+}
+
+__global__ void pdec(unsigned char **l, unsigned char **offsets, unsigned char *round_key, unsigned char *out) {
+  
+  cuda_xor_16(&out[blockIdx.x * 16], offsets[blockIdx.x]);
+  cuda_decipher(&out[blockIdx.x * 16], round_key);
+  cuda_xor_16(&out[blockIdx.x * 16], offsets[blockIdx.x]);
+  
+}
+
+static void pocb_encrypt(const unsigned char * __restrict key, const unsigned char * __restrict nonce, OCB_NONCEPARAM
+  const unsigned char * __restrict message, unsigned int message_length, unsigned char * out) {
+  
+  time_t t;
+  
   const unsigned int m = message_length / 16;
-  const unsigned int l_length =
-    (message_length > associated_data_length) ?
-    (ocb_ntz_round(m) + 1) :
-    (ocb_ntz_round(associated_data_length / 16) + 1);
+  const unsigned int l_length = ocb_ntz_round(m) + 1;
+
   unsigned char l[l_length][16];
   unsigned char l_asterisk[16] = {0};
   unsigned char l_dollar[16];
@@ -443,29 +627,53 @@ static void ocb_encrypt(const unsigned char * __restrict key, const unsigned cha
 
   ocb_memcpy(out, message, message_length);
 
-  cudaMalloc((void**)&d_sbox, 256 * sizeof(char));
-  cudaMalloc((void**)&d_rsbox, 256 * sizeof(char));
+  unsigned char offsets[m][16];
+  
+  for(int i = 0; i < 16; i++) {
+    offsets[0][i] = offset[i];
+  }
+
+  for (int i = 0; i < m-1; i++) {
+    xor_16(offsets[i], l[ocb_ntz(i + 1)]);
+    memcpy(offsets[i+1], offsets[i], 16);
+  }
+
+  xor_16(offsets[m-1], l[ocb_ntz(m)]);
+
+  unsigned char *d_sbox, *d_rsbox, **d_l, **d_offsets, *d_round_key, *d_out;
+
+  // cudaMalloc((void**)&d_sbox, 256 * sizeof(char));
+  // cudaMalloc((void**)&d_rsbox, 256 * sizeof(char));
   cudaMalloc((void**)&d_l, l_length * 16 * sizeof(char));
-  cudaMalloc((void**)&d_offset, 24 * sizeof(char));
+  cudaMalloc((void**)&d_offsets, m * 16 * sizeof(char));
   cudaMalloc((void**)&d_round_key, 240 * sizeof(char));
-  cudaMalloc((void**)&d_out, m * sizeof(char));
+  cudaMalloc((void**)&d_out, message_length * sizeof(char));
 
-  cudaMemcpy(d_sbox, sbox, 256 * sizeof(char), cudaHostToDevice)
-  cudaMemcpy(d_rsbox, rsbox, 256 * sizeof(char), cudaHostToDevice)
-  cudaMemcpy(d_l, l, l_length * 16 * sizeof(char), cudaHostToDevice);
-  cudaMemcpy(d_offset, offset, 24 * sizeof(char), cudaHostToDevice);
-  cudaMemcpy(d_round_key, round_key, 240 * sizeof(char), cudaHostToDevice);
-  cudaMemcpy(d_out, out, m * sizeof(char), cudaHostToDevice);
+  cudaMemcpyToSymbol(d_sbox, sbox, 256 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpyToSymbol(d_rsbox, rsbox, 256 * sizeof(char), cudaMemcpyHostToDevice);
+  
+  cudaMemcpy(d_l, l, l_length * 16 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_offsets, offsets, m * 16 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_round_key, round_key, 240 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_out, out, message_length * sizeof(char), cudaMemcpyHostToDevice);
 
-  pllize<<<m, 1>>>(d_l, d_offset, d_round_key, d_out);
+  t = clock();
+  penc<<<m, 1>>>(d_l, d_offsets, d_round_key, d_out);
+  t = clock() - t;
 
-  cudaMemcpy(out, d_out, m * sizeof(char), cudaDeviceToHost);
+  printf("Parallel Encipher Time: %d\n", t * 1000 / CLOCKS_PER_SEC);
 
-  for (int i = 0; i < m; i++) {
-    xor_16(offset, l[ocb_ntz(i + 1)]);
-    xor_16(&out[i * 16], offset);
-    cipher(&out[i * 16], round_key);
-    xor_16(&out[i * 16], offset);
+  cudaMemcpy(out, d_out, message_length * sizeof(char), cudaMemcpyDeviceToHost);
+
+  cudaFree(d_sbox);
+  cudaFree(d_rsbox);
+  cudaFree(d_l);
+  cudaFree(d_offsets);
+  cudaFree(d_round_key);
+  cudaFree(d_out);
+
+  for(int i = 0; i < 16; i++) {
+    offset[i] = offsets[m-1][i];
   }
 
   const unsigned int p_asterisk_length = (unsigned int) (message_length % 16);
@@ -490,22 +698,15 @@ static void ocb_encrypt(const unsigned char * __restrict key, const unsigned cha
   xor_16(checksum, offset);
   xor_16(checksum, l_dollar);
   cipher(checksum, round_key);
-#ifndef OCB_NO_AD
-  hash(round_key, associated_data, associated_data_length, l, l_asterisk, offset);
-  xor_16(checksum, offset);
-#endif
+
   for (int i = 0; i < 16; i++)
     out[full_block_length + p_asterisk_length + i] = checksum[i];
 }
 
-static int ocb_decrypt(const unsigned char * __restrict key, const unsigned char * __restrict nonce, OCB_NONCEPARAM
-  const unsigned char * __restrict encrypted, unsigned int encrypted_length, OCB_ADPARAM
-  unsigned char * __restrict out) {
+static int pocb_decrypt(const unsigned char * __restrict key, const unsigned char * __restrict nonce, OCB_NONCEPARAM
+  const unsigned char * __restrict encrypted, unsigned int encrypted_length, unsigned char * __restrict out) {
   const unsigned int m = encrypted_length / 16;
-  const unsigned int l_length =
-    (encrypted_length > associated_data_length) ?
-    (ocb_ntz_round(m) + 1) :
-    (ocb_ntz_round(associated_data_length / 16) + 1);
+  const unsigned int l_length = ocb_ntz_round(m) + 1;
   unsigned char l[l_length][16];
   unsigned char l_asterisk[16] = {0};
   unsigned char l_dollar[16];
@@ -549,11 +750,49 @@ static int ocb_decrypt(const unsigned char * __restrict key, const unsigned char
 
   ocb_memcpy(out, encrypted, full_block_length);
 
-  for (int i = 0; i < m; i++) {
-    xor_16(offset, l[ocb_ntz(i + 1)]);
-    xor_16(&out[i * 16], offset);
-    decipher(&out[i * 16], round_key);
-    xor_16(&out[i * 16], offset);
+  unsigned char offsets[m][16];
+
+  for(int i = 0; i < 16; i++) {
+    offsets[0][i] = offset[i];
+  }
+
+  for (int i = 0; i < m-1; i++) {
+    xor_16(offsets[i], l[ocb_ntz(i + 1)]);
+    memcpy(offsets[i+1], offsets[i], 16);
+  }
+
+  xor_16(offsets[m-1], l[ocb_ntz(m)]);
+
+  unsigned char *d_sbox, *d_rsbox, **d_l, **d_offsets, *d_round_key, *d_out;
+
+  // cudaMalloc((void**)&d_sbox, 256 * sizeof(char));
+  // cudaMalloc((void**)&d_rsbox, 256 * sizeof(char));
+  cudaMalloc((void**)&d_l, l_length * 16 * sizeof(char));
+  cudaMalloc((void**)&d_offsets, m * 16 * sizeof(char));
+  cudaMalloc((void**)&d_round_key, 240 * sizeof(char));
+  cudaMalloc((void**)&d_out, full_block_length * sizeof(char));
+
+  cudaMemcpyToSymbol(d_sbox, sbox, 256 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpyToSymbol(d_rsbox, rsbox, 256 * sizeof(char), cudaMemcpyHostToDevice);
+  
+  cudaMemcpy(d_l, l, l_length * 16 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_offsets, offsets, m * 16 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_round_key, round_key, 240 * sizeof(char), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_out, out, full_block_length * sizeof(char), cudaMemcpyHostToDevice);
+
+  pdec<<<m, 1>>>(d_l, d_offsets, d_round_key, d_out);
+
+  cudaMemcpy(out, d_out, full_block_length * sizeof(char), cudaMemcpyDeviceToHost);
+
+  cudaFree(d_sbox);
+  cudaFree(d_rsbox);
+  cudaFree(d_l);
+  cudaFree(d_offsets);
+  cudaFree(d_round_key);
+  cudaFree(d_out);
+
+  for(int i = 0; i < 16; i++) {
+    offset[i] = offsets[m-1][i];
   }
 
   unsigned char checksum[16] = {0};
@@ -580,10 +819,7 @@ static int ocb_decrypt(const unsigned char * __restrict key, const unsigned char
   xor_16(checksum, offset);
   xor_16(checksum, l_dollar);
   cipher(checksum, round_key);
-#ifndef OCB_NO_AD
-  hash(round_key, associated_data, associated_data_length, l, l_asterisk, offset);
-  xor_16(checksum, offset);
-#endif
+
   xor_16(checksum, &encrypted[encrypted_length]);
   unsigned char diff = 0;
   for (unsigned int i = 0; i < 16; i++)
